@@ -164,6 +164,15 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
                 var userMapping = this.query("findById", member, "User").getSingleResult();
                 groupMembers.add(Member.builder().value(userMapping.getExternalId()).build());
             }
+            // Note: we intentionally do not emit a PatchOp on path "externalId".
+            // Per SCIM 2.0 §3.5.2 / §7 the "externalId" attribute is read-only
+            // from the service provider's perspective and MUST be carried only on
+            // create or full-replace (PUT). Including it as a PatchOp in a
+            // multi-op PATCH triggers undefined behaviour in some Service
+            // Providers (notably implementations built on the captaingoldfish
+            // scim-sdk, where presence of the externalId op silently aborts
+            // sibling ops on "members"). Carrying displayName + members is
+            // sufficient for downstream replication.
             patchBuilder.addOperation()
                 .path("members")
                 .op(PatchOp.REPLACE)
@@ -172,10 +181,6 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
                 .op(PatchOp.REPLACE)
                 .path("displayName")
                 .value(displayName)
-                .next()
-                .op(PatchOp.REPLACE)
-                .path("externalId")
-                .value(id)
                 .build();
         } else {
             patchBuilder.addOperation()
@@ -186,10 +191,6 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
                 .op(PatchOp.REPLACE)
                 .path("displayName")
                 .value(displayName)
-                .next()
-                .op(PatchOp.REPLACE)
-                .path("externalId")
-                .value(id)
                 .build();
 
             }
