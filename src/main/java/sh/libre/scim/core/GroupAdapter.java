@@ -31,6 +31,12 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
     // outgoing Group payloads can include each member's "display" without
     // re-querying the user model from inside toSCIM/toPatchBuilder.
     private Map<String, String> memberDisplays = new HashMap<>();
+    // Keycloak user id -> externalId attribute (typically the SCIM-inbound
+    // client's identifier for the user, e.g. Okta's "00u..." id). Populated
+    // in apply(GroupModel). When non-empty, used as members[].value in the
+    // outgoing payload so downstreams that key membership rows by the
+    // upstream IdP identifier resolve consistently across SCIM clients.
+    private Map<String, String> memberExternalIds = new HashMap<>();
 
     public GroupAdapter(KeycloakSession session, String componentId) {
         super(session, componentId, "Group", Logger.getLogger(GroupAdapter.class));
@@ -55,12 +61,21 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
     public void apply(GroupModel group) {
         setId(group.getId());
         setDisplayName(group.getName());
-        this.memberDisplays = session.users()
+        this.memberDisplays = new HashMap<>();
+        this.memberExternalIds = new HashMap<>();
+        session.users()
                 .getGroupMembersStream(session.getContext().getRealm(), group)
-                .collect(Collectors.toMap(
-                        x -> x.getId(),
-                        x -> x.getUsername() == null ? "" : x.getUsername(),
-                        (a, b) -> a));
+                .forEach(u -> {
+                    String uname = u.getUsername();
+                    memberDisplays.put(u.getId(), uname == null ? "" : uname);
+                    // SCIM externalId on the user (set by an upstream SCIM
+                    // inbound client, e.g. Okta) is conventionally stored as
+                    // a Keycloak user attribute named "externalId". Falls
+                    // back to empty if absent and the local SCIM mapping's
+                    // external id is used instead at serialisation time.
+                    String ext = u.getFirstAttribute("externalId");
+                    memberExternalIds.put(u.getId(), ext == null ? "" : ext);
+                });
         this.members = this.memberDisplays.keySet();
         this.skip = StringUtils.equals(group.getFirstAttribute("scim-skip"), "true");
     }
@@ -92,7 +107,19 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
                 var groupMember = new Member();
                 try {
                     var userMapping = this.query("findById", member, "User").getSingleResult();
-                    groupMember.setValue(userMapping.getExternalId());
+                    // Prefer the user's SCIM externalId attribute as
+                    // members[].value so downstreams that index members by
+                    // the upstream IdP identifier (e.g. Okta id, set on
+                    // Keycloak users by inbound SCIM provisioning) keep
+                    // resolving the same member across SCIM client
+                    // implementations. Fall back to the local SCIM-mapping
+                    // external id if no externalId attribute is set on
+                    // the user.
+                    String externalAttr = memberExternalIds.get(member);
+                    String valueId = (externalAttr != null && !externalAttr.isEmpty())
+                            ? externalAttr
+                            : userMapping.getExternalId();
+                    groupMember.setValue(valueId);
                     var ref = new URI(String.format("Users/%s", userMapping.getExternalId()));
                     groupMember.setRef(ref.toString());
                     // Populate "display" with the Keycloak username and "type"
@@ -181,8 +208,15 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
         if (members.size() > 0) {
             for (String member : members) {
                 var userMapping = this.query("findById", member, "User").getSingleResult();
+                // See toSCIM(): prefer the user's SCIM externalId attribute
+                // for members[].value, fall back to the SCIM-mapping
+                // external id otherwise.
+                String externalAttr = memberExternalIds.get(member);
+                String valueId = (externalAttr != null && !externalAttr.isEmpty())
+                        ? externalAttr
+                        : userMapping.getExternalId();
                 var memberBuilder = Member.builder()
-                        .value(userMapping.getExternalId())
+                        .value(valueId)
                         .type("User");
                 var display = memberDisplays.get(member);
                 if (display != null && !display.isEmpty()) {
