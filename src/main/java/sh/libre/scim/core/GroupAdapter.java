@@ -3,8 +3,10 @@ package sh.libre.scim.core;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -25,6 +27,10 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
 
     private String displayName;
     private Set<String> members = new HashSet<String>();
+    // Keycloak user id -> username. Populated in apply(GroupModel) so that
+    // outgoing Group payloads can include each member's "display" without
+    // re-querying the user model from inside toSCIM/toPatchBuilder.
+    private Map<String, String> memberDisplays = new HashMap<>();
 
     public GroupAdapter(KeycloakSession session, String componentId) {
         super(session, componentId, "Group", Logger.getLogger(GroupAdapter.class));
@@ -49,10 +55,13 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
     public void apply(GroupModel group) {
         setId(group.getId());
         setDisplayName(group.getName());
-        this.members = session.users()
+        this.memberDisplays = session.users()
                 .getGroupMembersStream(session.getContext().getRealm(), group)
-                .map(x -> x.getId())
-                .collect(Collectors.toSet());
+                .collect(Collectors.toMap(
+                        x -> x.getId(),
+                        x -> x.getUsername() == null ? "" : x.getUsername(),
+                        (a, b) -> a));
+        this.members = this.memberDisplays.keySet();
         this.skip = StringUtils.equals(group.getFirstAttribute("scim-skip"), "true");
     }
 
@@ -86,6 +95,16 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
                     groupMember.setValue(userMapping.getExternalId());
                     var ref = new URI(String.format("Users/%s", userMapping.getExternalId()));
                     groupMember.setRef(ref.toString());
+                    // Populate "display" with the Keycloak username and "type"
+                    // with "User" so the outgoing member object matches the
+                    // shape emitted by other Keycloak SCIM plugins (e.g.
+                    // scim-for-keycloak). Service Providers commonly surface
+                    // "display" in their UI / membership listings.
+                    groupMember.setType("User");
+                    var display = memberDisplays.get(member);
+                    if (display != null && !display.isEmpty()) {
+                        groupMember.setDisplay(display);
+                    }
                     groupMembers.add(groupMember);
                 } catch (Exception e) {
                     LOGGER.error(e);
@@ -162,7 +181,14 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
         if (members.size() > 0) {
             for (String member : members) {
                 var userMapping = this.query("findById", member, "User").getSingleResult();
-                groupMembers.add(Member.builder().value(userMapping.getExternalId()).build());
+                var memberBuilder = Member.builder()
+                        .value(userMapping.getExternalId())
+                        .type("User");
+                var display = memberDisplays.get(member);
+                if (display != null && !display.isEmpty()) {
+                    memberBuilder.display(display);
+                }
+                groupMembers.add(memberBuilder.build());
             }
             // Note: we intentionally do not emit a PatchOp on path "externalId".
             // Per SCIM 2.0 §3.5.2 / §7 the "externalId" attribute is read-only
