@@ -5,7 +5,7 @@ plugins {
 }
 
 group = 'sh.libre.scim'
-version = '1.0-patch.3'
+version = '1.0-patch.4'
 description = 'keycloak-scim'
 
 java.sourceCompatibility = JavaVersion.VERSION_17

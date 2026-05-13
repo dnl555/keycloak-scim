@@ -37,6 +37,10 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
     // outgoing payload so downstreams that key membership rows by the
     // upstream IdP identifier resolve consistently across SCIM clients.
     private Map<String, String> memberExternalIds = new HashMap<>();
+    // Group's own SCIM externalId attribute (typically the SCIM-inbound
+    // client's identifier for the group). Populated in apply(GroupModel).
+    // When non-empty, emitted as the outgoing SCIM Group.externalId.
+    private String groupExternalIdAttr = "";
 
     public GroupAdapter(KeycloakSession session, String componentId) {
         super(session, componentId, "Group", Logger.getLogger(GroupAdapter.class));
@@ -61,6 +65,8 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
     public void apply(GroupModel group) {
         setId(group.getId());
         setDisplayName(group.getName());
+        String groupExt = group.getFirstAttribute("externalId");
+        this.groupExternalIdAttr = (groupExt == null) ? "" : groupExt;
         this.memberDisplays = new HashMap<>();
         this.memberExternalIds = new HashMap<>();
         session.users()
@@ -99,7 +105,14 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
     public Group toSCIM(Boolean addMeta) {
         var group = new Group();
         group.setId(externalId);
-        group.setExternalId(id);
+        // If the Keycloak group carries an externalId attribute (set by the
+        // SCIM-inbound client, typically the upstream IdP identifier like
+        // Okta's group id), emit it as the outgoing SCIM Group.externalId.
+        // Falls back to the Keycloak group id otherwise, matching the prior
+        // behaviour for groups that never went through a SCIM-inbound CREATE.
+        group.setExternalId((groupExternalIdAttr != null && !groupExternalIdAttr.isEmpty())
+                ? groupExternalIdAttr
+                : id);
         group.setDisplayName(displayName);
         if (members.size() > 0) {
             var groupMembers = new ArrayList<Member>();
