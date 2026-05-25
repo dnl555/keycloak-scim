@@ -120,6 +120,22 @@ public class UserAdapter extends Adapter<UserModel, User> {
         setDisplayName(displayName);
         setEmail(user.getEmail());
         setActive(user.isEnabled());
+        // Carry the SCIM externalId attribute set by inbound SCIM (Okta,
+        // Entra, etc. write their own identifier here) so outbound payloads
+        // emit it as the SCIM "id" field. Matches v1.0-patch.3 for Group
+        // members where externalId becomes members[].value, so downstreams
+        // index Users and Groups by the same upstream identifier.
+        // Keycloak 26 user profile fields may store the attribute either as
+        // the bare "externalId" key (when declared on the realm's User
+        // Profile) or as the SCIM-namespaced key (default unmanaged path).
+        String userExternalId = user.getFirstAttribute("externalId");
+        if (StringUtils.isEmpty(userExternalId)) {
+            userExternalId = user.getFirstAttribute(
+                "urn:ietf:params:scim:schemas:core:2.0:User:externalId");
+        }
+        if (StringUtils.isNotEmpty(userExternalId)) {
+            setExternalId(userExternalId);
+        }
         var rolesSet = new HashSet<String>();
         user.getGroupsStream().flatMap(g -> g.getRoleMappingsStream())
                 .filter(r -> "true".equals(r.getFirstAttribute("scim"))).map(r -> r.getName())
