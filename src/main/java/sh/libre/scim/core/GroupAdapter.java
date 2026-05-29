@@ -3,8 +3,10 @@ package sh.libre.scim.core;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -25,6 +27,20 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
 
     private String displayName;
     private Set<String> members = new HashSet<String>();
+    // Keycloak user id -> username. Populated in apply(GroupModel) so that
+    // outgoing Group payloads can include each member's "display" without
+    // re-querying the user model from inside toSCIM/toPatchBuilder.
+    private Map<String, String> memberDisplays = new HashMap<>();
+    // Keycloak user id -> externalId attribute (typically the SCIM-inbound
+    // client's identifier for the user, e.g. Okta's "00u..." id). Populated
+    // in apply(GroupModel). When non-empty, used as members[].value in the
+    // outgoing payload so downstreams that key membership rows by the
+    // upstream IdP identifier resolve consistently across SCIM clients.
+    private Map<String, String> memberExternalIds = new HashMap<>();
+    // Group's own SCIM externalId attribute (typically the SCIM-inbound
+    // client's identifier for the group). Populated in apply(GroupModel).
+    // When non-empty, emitted as the outgoing SCIM Group.externalId.
+    private String groupExternalIdAttr = "";
 
     public GroupAdapter(KeycloakSession session, String componentId) {
         super(session, componentId, "Group", Logger.getLogger(GroupAdapter.class));
@@ -49,10 +65,24 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
     public void apply(GroupModel group) {
         setId(group.getId());
         setDisplayName(group.getName());
-        this.members = session.users()
+        String groupExt = group.getFirstAttribute("externalId");
+        this.groupExternalIdAttr = (groupExt == null) ? "" : groupExt;
+        this.memberDisplays = new HashMap<>();
+        this.memberExternalIds = new HashMap<>();
+        session.users()
                 .getGroupMembersStream(session.getContext().getRealm(), group)
-                .map(x -> x.getId())
-                .collect(Collectors.toSet());
+                .forEach(u -> {
+                    String uname = u.getUsername();
+                    memberDisplays.put(u.getId(), uname == null ? "" : uname);
+                    // SCIM externalId on the user (set by an upstream SCIM
+                    // inbound client, e.g. Okta) is conventionally stored as
+                    // a Keycloak user attribute named "externalId". Falls
+                    // back to empty if absent and the local SCIM mapping's
+                    // external id is used instead at serialisation time.
+                    String ext = u.getFirstAttribute("externalId");
+                    memberExternalIds.put(u.getId(), ext == null ? "" : ext);
+                });
+        this.members = this.memberDisplays.keySet();
         this.skip = StringUtils.equals(group.getFirstAttribute("scim-skip"), "true");
     }
 
@@ -75,7 +105,14 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
     public Group toSCIM(Boolean addMeta) {
         var group = new Group();
         group.setId(externalId);
-        group.setExternalId(id);
+        // If the Keycloak group carries an externalId attribute (set by the
+        // SCIM-inbound client, typically the upstream IdP identifier like
+        // Okta's group id), emit it as the outgoing SCIM Group.externalId.
+        // Falls back to the Keycloak group id otherwise, matching the prior
+        // behaviour for groups that never went through a SCIM-inbound CREATE.
+        group.setExternalId((groupExternalIdAttr != null && !groupExternalIdAttr.isEmpty())
+                ? groupExternalIdAttr
+                : id);
         group.setDisplayName(displayName);
         if (members.size() > 0) {
             var groupMembers = new ArrayList<Member>();
@@ -83,9 +120,31 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
                 var groupMember = new Member();
                 try {
                     var userMapping = this.query("findById", member, "User").getSingleResult();
-                    groupMember.setValue(userMapping.getExternalId());
+                    // Prefer the user's SCIM externalId attribute as
+                    // members[].value so downstreams that index members by
+                    // the upstream IdP identifier (e.g. Okta id, set on
+                    // Keycloak users by inbound SCIM provisioning) keep
+                    // resolving the same member across SCIM client
+                    // implementations. Fall back to the local SCIM-mapping
+                    // external id if no externalId attribute is set on
+                    // the user.
+                    String externalAttr = memberExternalIds.get(member);
+                    String valueId = (externalAttr != null && !externalAttr.isEmpty())
+                            ? externalAttr
+                            : userMapping.getExternalId();
+                    groupMember.setValue(valueId);
                     var ref = new URI(String.format("Users/%s", userMapping.getExternalId()));
                     groupMember.setRef(ref.toString());
+                    // Populate "display" with the Keycloak username and "type"
+                    // with "User" so the outgoing member object matches the
+                    // shape emitted by other Keycloak SCIM plugins (e.g.
+                    // scim-for-keycloak). Service Providers commonly surface
+                    // "display" in their UI / membership listings.
+                    groupMember.setType("User");
+                    var display = memberDisplays.get(member);
+                    if (display != null && !display.isEmpty()) {
+                        groupMember.setDisplay(display);
+                    }
                     groupMembers.add(groupMember);
                 } catch (Exception e) {
                     LOGGER.error(e);
@@ -162,8 +221,31 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
         if (members.size() > 0) {
             for (String member : members) {
                 var userMapping = this.query("findById", member, "User").getSingleResult();
-                groupMembers.add(Member.builder().value(userMapping.getExternalId()).build());
+                // See toSCIM(): prefer the user's SCIM externalId attribute
+                // for members[].value, fall back to the SCIM-mapping
+                // external id otherwise.
+                String externalAttr = memberExternalIds.get(member);
+                String valueId = (externalAttr != null && !externalAttr.isEmpty())
+                        ? externalAttr
+                        : userMapping.getExternalId();
+                var memberBuilder = Member.builder()
+                        .value(valueId)
+                        .type("User");
+                var display = memberDisplays.get(member);
+                if (display != null && !display.isEmpty()) {
+                    memberBuilder.display(display);
+                }
+                groupMembers.add(memberBuilder.build());
             }
+            // Note: we intentionally do not emit a PatchOp on path "externalId".
+            // Per SCIM 2.0 §3.5.2 / §7 the "externalId" attribute is read-only
+            // from the service provider's perspective and MUST be carried only on
+            // create or full-replace (PUT). Including it as a PatchOp in a
+            // multi-op PATCH triggers undefined behaviour in some Service
+            // Providers (notably implementations built on the captaingoldfish
+            // scim-sdk, where presence of the externalId op silently aborts
+            // sibling ops on "members"). Carrying displayName + members is
+            // sufficient for downstream replication.
             patchBuilder.addOperation()
                 .path("members")
                 .op(PatchOp.REPLACE)
@@ -172,10 +254,6 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
                 .op(PatchOp.REPLACE)
                 .path("displayName")
                 .value(displayName)
-                .next()
-                .op(PatchOp.REPLACE)
-                .path("externalId")
-                .value(id)
                 .build();
         } else {
             patchBuilder.addOperation()
@@ -186,10 +264,6 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
                 .op(PatchOp.REPLACE)
                 .path("displayName")
                 .value(displayName)
-                .next()
-                .op(PatchOp.REPLACE)
-                .path("externalId")
-                .value(id)
                 .build();
 
             }
