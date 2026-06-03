@@ -69,7 +69,10 @@ public class ScimEventListenerProvider implements EventListenerProvider {
             LOGGER.infof("%s %s", userId, event.getOperationType());
             if (event.getOperationType() == OperationType.CREATE) {
                 var user = getUser(userId);
-                if (user.isEmailVerified()) {
+                // Push every provisioned user, regardless of email verification.
+                // IdP-provisioned users (SCIM, admin, REST) are authoritative and
+                // often have no verified email; only skip service-account users.
+                if (user != null && user.getServiceAccountClientLink() == null) {
                     dispatcher.run(ScimDispatcher.SCOPE_USER, client -> client.create(UserAdapter.class, user));
                     user.getGroupsStream().forEach(group -> {
                         dispatcher.run(ScimDispatcher.SCOPE_GROUP, client -> client.replace(GroupAdapter.class, group));
@@ -78,15 +81,12 @@ public class ScimEventListenerProvider implements EventListenerProvider {
             }
             if (event.getOperationType() == OperationType.UPDATE) {
                 var user = getUser(userId);
-                if (user.isEmailVerified()) {
+                if (user != null && user.getServiceAccountClientLink() == null) {
                     dispatcher.run(ScimDispatcher.SCOPE_USER, client -> client.replace(UserAdapter.class, user));
                 }
             }
             if (event.getOperationType() == OperationType.DELETE) {
-                var user = getUser(userId);
-                if (user.isEmailVerified()) {
-                    dispatcher.run(ScimDispatcher.SCOPE_USER, client -> client.delete(UserAdapter.class, userId));
-                }
+                dispatcher.run(ScimDispatcher.SCOPE_USER, client -> client.delete(UserAdapter.class, userId));
             }
         }
         if (event.getResourceType() == ResourceType.GROUP) {
