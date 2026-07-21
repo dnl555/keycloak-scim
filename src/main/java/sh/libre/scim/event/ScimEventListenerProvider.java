@@ -29,7 +29,6 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         dispatcher = new ScimDispatcher(session);
         patterns.put(ResourceType.USER, Pattern.compile("users/(.+)"));
         patterns.put(ResourceType.GROUP, Pattern.compile("groups/([\\w-]+)(/children)?"));
-        patterns.put(ResourceType.GROUP_MEMBERSHIP, Pattern.compile("users/(.+)/groups/(.+)"));
         patterns.put(ResourceType.REALM_ROLE_MAPPING, Pattern.compile("^(.+)/(.+)/role-mappings"));
     }
 
@@ -56,12 +55,18 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
     @Override
     public void onEvent(AdminEvent event, boolean includeRepresentation) {
+        if (event.getResourceType() == ResourceType.GROUP_MEMBERSHIP) {
+            onMembershipEvent(event);
+            return;
+        }
         var pattern = patterns.get(event.getResourceType());
         if (pattern == null) {
             return;
         }
         var matcher = pattern.matcher(event.getResourcePath());
         if (!matcher.find()) {
+            LOGGER.debugf("ignoring %s event, unrecognised resource path %s",
+                    event.getResourceType(), event.getResourcePath());
             return;
         }
         if (event.getResourceType() == ResourceType.USER) {
@@ -105,15 +110,6 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                         client -> client.delete(GroupAdapter.class, groupId));
             }
         }
-        if (event.getResourceType() == ResourceType.GROUP_MEMBERSHIP) {
-            var userId = matcher.group(1);
-            var groupId = matcher.group(2);
-            LOGGER.infof("%s %s from %s", event.getOperationType(), userId, groupId);
-            var group = getGroup(groupId);
-            dispatcher.run(ScimDispatcher.SCOPE_GROUP, client -> client.replace(GroupAdapter.class, group));
-            var user = getUser(userId);
-            dispatcher.run(ScimDispatcher.SCOPE_USER, client -> client.replace(UserAdapter.class, user));
-        }
         if (event.getResourceType() == ResourceType.REALM_ROLE_MAPPING) {
             var type = matcher.group(1);
             var id = matcher.group(2);
@@ -128,6 +124,25 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 });
             }
         }
+    }
+
+    // Membership is recorded from whichever side wrote it: users/{u}/groups/{g} by the Admin REST
+    // API, groups/{g}/members/{u} by a SCIM server patching Group.members. Handling only the first
+    // shape means IdP-driven membership changes never reach the downstream provider.
+    private void onMembershipEvent(AdminEvent event) {
+        var parsed = MembershipPath.parse(event.getResourcePath());
+        if (parsed.isEmpty()) {
+            LOGGER.debugf("ignoring membership event, unrecognised resource path %s",
+                    event.getResourcePath());
+            return;
+        }
+        var userId = parsed.get().userId();
+        var groupId = parsed.get().groupId();
+        LOGGER.infof("%s %s from %s", event.getOperationType(), userId, groupId);
+        var group = getGroup(groupId);
+        dispatcher.run(ScimDispatcher.SCOPE_GROUP, client -> client.replace(GroupAdapter.class, group));
+        var user = getUser(userId);
+        dispatcher.run(ScimDispatcher.SCOPE_USER, client -> client.replace(UserAdapter.class, user));
     }
 
     private UserModel getUser(String id) {
