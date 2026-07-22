@@ -27,6 +27,7 @@ import com.google.common.net.HttpHeaders;
 import io.github.resilience4j.core.IntervalFunction;
 import io.github.resilience4j.retry.RetryConfig;
 import io.github.resilience4j.retry.RetryRegistry;
+import sh.libre.scim.jpa.ScimResource;
 
 
 public class ScimClient {
@@ -94,6 +95,23 @@ public class ScimClient {
 
     protected String BearerAuthentication(String token) {
         return "Bearer " + token ;
+    }
+
+    /**
+     * The key the downstream assigned, which is how its resource is addressed. It has to come
+     * from the stored mapping: adapter state is also written from the IdP's current attribute,
+     * so reading it there let an IdP identifier change repoint our requests at a resource the
+     * downstream does not have, failing every update for that user.
+     *
+     * @param mapping  stored mapping for this resource
+     * @param fallback value to use when no mapping key is recorded yet
+     * @return key to address the downstream resource by
+     */
+    static String targetKey(ScimResource mapping, String fallback) {
+        if (mapping != null && mapping.getExternalId() != null && !mapping.getExternalId().isEmpty()) {
+            return mapping.getExternalId();
+        }
+        return fallback;
     }
 
     protected String genScimUrl(String scimEndpoint, String resourcePath) {
@@ -164,7 +182,7 @@ public class ScimClient {
             }
             var resource = adapter.query("findById", adapter.getId()).getSingleResult();
             adapter.apply(resource);
-            String url = genScimUrl(adapter.getSCIMEndpoint(), adapter.getExternalId());
+            String url = genScimUrl(adapter.getSCIMEndpoint(), targetKey(resource, adapter.getExternalId()));
             var retry = registry.retry("replace-" + adapter.getId());
             ServerResponse<S> response = retry.executeSupplier(() -> {
                 try {
@@ -208,7 +226,7 @@ public class ScimClient {
 
             ServerResponse<S> response = retry.executeSupplier(() -> {
                 try {
-                    return scimRequestBuilder.delete(genScimUrl(adapter.getSCIMEndpoint(), adapter.getExternalId()),
+                    return scimRequestBuilder.delete(genScimUrl(adapter.getSCIMEndpoint(), targetKey(resource, adapter.getExternalId())),
                                                                 adapter.getResourceClass())
                                              .sendRequest();
                 } catch (ResponseException e) {
