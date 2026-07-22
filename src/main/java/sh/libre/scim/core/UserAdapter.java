@@ -173,16 +173,50 @@ public class UserAdapter extends Adapter<UserModel, User> {
         }
     }
 
+    /**
+     * Which identifier to put in the outgoing externalId.
+     *
+     * Once the downstream has assigned a key it is how the resource is addressed, so it wins:
+     * sending a different value asks the downstream to re-key, which it refuses. Before that
+     * key exists we send the IdP's own identifier so the downstream can correlate, and if the
+     * user never came through SCIM at all we fall back to the local id.
+     *
+     * @param downstreamKey key the downstream assigned, from the stored mapping
+     * @param idpIdentifier externalId the IdP currently sends
+     * @param localId       Keycloak user id
+     * @return identifier to send
+     */
+    public static String resolveExternalId(String downstreamKey, String idpIdentifier, String localId) {
+        if (StringUtils.isNotEmpty(downstreamKey)) {
+            return downstreamKey;
+        }
+        if (StringUtils.isNotEmpty(idpIdentifier)) {
+            return idpIdentifier;
+        }
+        return localId;
+    }
+
+    /**
+     * True when the IdP has started sending a different identifier than the one the downstream is
+     * keyed by. Worth surfacing: the push still succeeds, but the two systems now disagree about
+     * who this user is, and only a human can decide whether a re-provision is wanted.
+     */
+    public static boolean identifierDiverged(String downstreamKey, String idpIdentifier) {
+        return StringUtils.isNotEmpty(downstreamKey)
+            && StringUtils.isNotEmpty(idpIdentifier)
+            && !downstreamKey.equals(idpIdentifier);
+    }
+
     @Override
     public User toSCIM(Boolean addMeta) {
         var user = new User();
-        // Emit the upstream SCIM externalId (e.g. Okta's user id) when present
-        // so the downstream correlates by the same identifier it already
-        // stores. Falls back to the Keycloak id for users that never went
-        // through a SCIM-inbound CREATE. Mirrors Group.externalId.
-        user.setExternalId((userExternalIdAttr != null && !userExternalIdAttr.isEmpty())
-                ? userExternalIdAttr
-                : id);
+        if (identifierDiverged(externalId, userExternalIdAttr)) {
+            LOGGER.warnf(
+                "user %s: IdP now sends externalId %s but the downstream resource is keyed by %s;"
+                + " keeping the downstream key. Re-keying needs the resource recreated downstream.",
+                id, userExternalIdAttr, externalId);
+        }
+        user.setExternalId(resolveExternalId(externalId, userExternalIdAttr, id));
         user.setUserName(username);
         user.setId(externalId);
         user.setDisplayName(displayName);
